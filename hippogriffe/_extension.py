@@ -38,12 +38,12 @@ class _PublicApi:
     ):
         self._objects: set[griffe.Object] = set()
         self._toplevel_objects: set[griffe.Object] = set()
-        self._data: dict[str, list[str]] = {}
+        self._data: dict[str, list[tuple[str, bool]]] = {}
         self._builtin_modules = builtin_modules
         for object_path in extra_public_objects:
             object_pieces = object_path.split(".")
             for i in reversed(range(1, len(object_pieces))):
-                module_name = "".join(object_pieces[:i])
+                module_name = ".".join(object_pieces[:i])
                 object_name = object_pieces[i:]
                 try:
                     object = importlib.import_module(module_name)
@@ -56,7 +56,10 @@ class _PublicApi:
                     paths = self._data[private_path]
                 except KeyError:
                     paths = self._data[private_path] = []
-                paths.append(object_path)
+                candidate = (object_path, False)
+                if candidate not in paths:
+                    paths.append(candidate)
+                break
         # Don't infinite loop on cycles. We only store Objects, and not Aliases, as in
         # cycles then the aliases with be distinct: `X.Y.X.Y` is not `X.Y`, though the
         # underlying object is the same.
@@ -74,7 +77,9 @@ class _PublicApi:
                     paths = self._data[item.path]
                 except KeyError:
                     paths = self._data[item.path] = []
-                paths.append(public_path)
+                candidate = (public_path, True)
+                if candidate not in paths:
+                    paths.append(candidate)
                 self._objects.add(item)
                 if toplevel_public:
                     self._toplevel_objects.add(item)
@@ -134,7 +139,7 @@ class _PublicApi:
                 "is correct."
             ) from e
         if len(paths) == 1:
-            return paths[0], True
+            return paths[0]
         else:
             raise ValueError(f"{key} has multiple paths in the public API: {paths}")
 
@@ -207,24 +212,57 @@ def _pretty_fn(
 _builtin_re = re.compile(r"builtins\.(\w+)")
 
 
+def _import_object_path(path: str) -> str | None:
+    pieces = path.split(".")
+    for i in reversed(range(1, len(pieces))):
+        module_name = ".".join(pieces[:i])
+        object_name = pieces[i:]
+        try:
+            obj = importlib.import_module(module_name)
+        except Exception:
+            continue
+        try:
+            for object_piece in object_name:
+                obj = getattr(obj, object_piece)
+        except AttributeError:
+            continue
+        return f"{obj.__module__}.{obj.__qualname__}"
+    return None
+
+
 # Modified version of `griffe.Class.resolved_bases`, so as not to drop builtins.
 def _resolved_bases(cls: griffe.Class) -> list[str | griffe.Object]:
     resolved_bases = []
+    seen: set[str] = set()
+    for base in getattr(cls, "resolved_bases", ()):
+        base_path = getattr(base, "path", getattr(base, "canonical_path", None))
+        if base_path is not None:
+            seen.add(base_path)
+        resolved_bases.append(base)
     for base in cls.bases:
         base_path = base if isinstance(base, str) else base.canonical_path
+        if base_path in seen:
+            continue
         match = _builtin_re.match(base_path)
         with contextlib.suppress(
             griffe.AliasResolutionError, griffe.CyclicAliasError, KeyError
         ):
             if match is None:
-                resolved_base = cls.modules_collection[base_path]
-                if resolved_base.is_alias:
-                    resolved_base = resolved_base.final_target
+                try:
+                    resolved_base = cls.modules_collection[base_path]
+                except KeyError:
+                    resolved_base = _import_object_path(base_path)
+                    if resolved_base is None:
+                        raise
+                else:
+                    if resolved_base.is_alias:
+                        resolved_base = resolved_base.final_target
             else:
                 resolved_base = match.group(1)
                 if not hasattr(builtins, resolved_base):
                     raise KeyError
             resolved_bases.append(resolved_base)
+            seen.add(base_path)
     return resolved_bases
 
 
@@ -232,8 +270,13 @@ def _collect_bases(cls: griffe.Class, public_api: _PublicApi) -> dict[str, bool]
     bases: dict[str, bool] = {}
     for base in _resolved_bases(cls):
         if isinstance(base, str):
-            # builtins case above
-            bases[base] = False
+            if "." not in base:
+                # builtins case above
+                bases[base] = False
+            else:
+                with contextlib.suppress(_NotInPublicApiException):
+                    public_base, autoref = public_api[base]
+                    bases[public_base] = autoref
         elif isinstance(base, griffe.Class):
             try:
                 base, autoref = public_api[base.path]
@@ -241,6 +284,12 @@ def _collect_bases(cls: griffe.Class, public_api: _PublicApi) -> dict[str, bool]
                 bases.update(_collect_bases(base, public_api))
             else:
                 bases[base] = autoref
+        else:
+            base_path = getattr(base, "path", getattr(base, "canonical_path", None))
+            if base_path is not None:
+                with contextlib.suppress(_NotInPublicApiException):
+                    public_base, autoref = public_api[base_path]
+                    bases[public_base] = autoref
     return bases
 
 
@@ -334,7 +383,7 @@ class HippogriffeExtension(griffe.Extension):
         # super clear in the docs.
         attr.labels.discard("module")
 
-    def on_package_loaded(
+    def on_package(
         self, *, pkg: griffe.Module, loader: griffe.GriffeLoader, **kwargs: Any
     ) -> None:
         assert self.top_level_public_api != {""}
@@ -413,3 +462,10 @@ class HippogriffeExtension(griffe.Extension):
                 path = obj.filepath.relative_to(toplevel)
                 url = repo_url.format(path=path, start=obj.lineno, end=obj.endlineno)
                 obj.extra["hippogriffe"]["url"] = url
+
+    # Griffe renamed `on_package_loaded` to `on_package` in 1.14 and removed the old
+    # hook in 2.x. Keep both so the extension works across supported versions.
+    def on_package_loaded(
+        self, *, pkg: griffe.Module, loader: griffe.GriffeLoader, **kwargs: Any
+    ) -> None:
+        self.on_package(pkg=pkg, loader=loader, **kwargs)
