@@ -84,3 +84,22 @@ def test_collect_bases_resolves_external_import_paths():
     bases = _collect_bases(cls, public_api)
 
     assert bases == {"xml.etree.ElementTree.Element": False}
+
+
+def test_collect_bases_ignores_typing_generic_marker():
+    pkg = _HashableNamespace(path="dummy", all_members={})
+    public_api = _PublicApi(
+        pkg=pkg,
+        top_level_public_api=set(),
+        builtin_modules=[],
+        extra_public_objects=[],
+    )
+    cls = _HashableNamespace(
+        resolved_bases=[],
+        bases=["typing.Generic"],
+        modules_collection={},
+    )
+
+    bases = _collect_bases(cls, public_api)
+
+    assert bases == {}

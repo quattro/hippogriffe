@@ -270,6 +270,8 @@ def _collect_bases(cls: griffe.Class, public_api: _PublicApi) -> dict[str, bool]
     bases: dict[str, bool] = {}
     for base in _resolved_bases(cls):
         if isinstance(base, str):
+            if base == "typing.Generic":
+                continue
             if "." not in base:
                 # builtins case above
                 bases[base] = False
